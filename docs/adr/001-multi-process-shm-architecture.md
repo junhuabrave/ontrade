@@ -25,7 +25,7 @@ Constraints:
 - Each component is its own process. One trading host per region; one component per pinned isolated core (architecture.md §5.1).
 - Inter-component communication: lock-free SPSC/MPSC ring buffers in POSIX shared memory, wrapped by Aeron IPC. The ring layout is fixed in `core/messaging/shm_ring.hpp` and is the contract.
 - **Pre-trade risk is the only exception:** it lives inline as a function call inside the OMS process. Even a shared-memory hop would consume too much of the budget on the order-emitting path.
-- All inter-process payloads use FlatBuffers (`core/proto/messages.fbs`) for zero-copy reads.
+- All inter-process payloads use fixed-layout POD structs (`core/proto/hot/messages.hpp`) — see ADR-002 for the wire-format choice.
 - Cross-host communication (HA replication, archive shipping) uses Aeron UDP unicast.
 
 ## Consequences

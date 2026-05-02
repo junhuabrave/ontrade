@@ -6,7 +6,7 @@ Python can be backtested deterministically against the live event archive;
 the same strategy logic will run in production either as a pybind11 plugin
 or be ported to a C++ plugin for hot-path strategies.
 
-Identifiers and price scales mirror core/proto/messages.fbs.
+Identifiers and price scales mirror core/proto/hot/messages.hpp.
 """
 
 from __future__ import annotations

@@ -553,7 +553,7 @@ These define the platform. Land them — with tests and ADRs — before any feat
 
 | File | Purpose |
 |---|---|
-| `core/proto/messages.fbs` | FlatBuffers message schema. **Single most important file in the system** — also the contract a future FPGA card writes/reads. Versioned with backward-compat policy. |
+| `core/proto/hot/messages.hpp` | Fixed-layout POD wire format for the hot-path shm rings. **Single most important file in the system** — also the contract a future FPGA card writes/reads. Layout is pinned by `static_assert`s; changes bump `kSchemaMajor` and require an ADR. See ADR-002. |
 | `core/runtime/clock.hpp` | Single source of time, mockable for replay |
 | `core/messaging/shm_ring.hpp` | SPSC/MPSC shared-memory ring layout (cache-line-aligned slots, sequence-number semantics, claim/commit) |
 | `core/messaging/aeron_bus.hpp` | Aeron IPC + archive wrapper for inter-process messaging needing durability/replay |
@@ -562,7 +562,7 @@ These define the platform. Land them — with tests and ADRs — before any feat
 | `strategies/sdk/strategy.py` | Python strategy SDK — identical surface to C++ strategy-runner plugin ABI |
 | `sim/matcher/` | Minimal price-time-priority matcher; contract-locked to live FIX-gateway behavior |
 
-Two of these (`messages.fbs` and `shm_ring.hpp`) also define the contract for the future FPGA last-hop program. Review them with that future in mind.
+Two of these (`core/proto/hot/messages.hpp` and `shm_ring.hpp`) also define the contract for the future FPGA last-hop program. Review them with that future in mind.
 
 ---
 
