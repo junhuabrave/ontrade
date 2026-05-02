@@ -10,4 +10,13 @@ if(ONTRADE_BUILD_TESTS)
     )
     ontrade_apply_warnings(clock_test)
     gtest_discover_tests(clock_test)
+
+    add_executable(latency_test latency_test.cc)
+    target_link_libraries(latency_test PRIVATE
+        ontrade_runtime
+        ontrade_proto_hot
+        GTest::gtest_main
+    )
+    ontrade_apply_warnings(latency_test)
+    gtest_discover_tests(latency_test)
 endif()
