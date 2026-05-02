@@ -1,0 +1,44 @@
+# Build
+/build/
+/build-*/
+/cmake-build-*/
+/.cache/
+/compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# IDE
+/.vscode/
+/.idea/
+/.clangd/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+/.venv/
+/venv/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+
+# Node
+/node_modules/
+/.next/
+
+# Generated
+/generated/
+*_generated.h
+*_generated.cc
+
+# Local Claude Code state
+/.claude/

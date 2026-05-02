@@ -1,0 +1,163 @@
+// Hot-path message schema for the OnTrade platform.
+//
+// THE contract. Every shared-memory ring on the order path uses these
+// messages, and a future FPGA ingress/egress card writes/reads the same
+// wire format (architecture.md §14).
+//
+// Versioning policy:
+//   - Adding a field at the end of an existing table is backward compatible.
+//   - Renaming, removing, or reordering fields requires bumping schema_major
+//     in MessageEnvelope and an ADR.
+//   - All ids are 64-bit so they survive long-running sessions and replay.
+//
+// This file currently covers the order side. Market-data messages (book
+// snapshots, deltas, trades) will land in a follow-up commit alongside the
+// md-normalizer skeleton.
+
+namespace ontrade.proto;
+
+file_identifier "OTRD";
+file_extension "otmsg";
+
+enum Side : uint8 {
+    Buy = 0,
+    Sell = 1,
+}
+
+enum OrdType : uint8 {
+    Market = 0,
+    Limit = 1,
+    Stop = 2,
+    StopLimit = 3,
+    PeggedMid = 4,
+}
+
+enum TimeInForce : uint8 {
+    Day = 0,
+    IOC = 1,
+    FOK = 2,
+    GTC = 3,
+    OPG = 4,        // at-the-open auction
+    CLO = 5,        // at-the-close auction
+}
+
+enum LiquidityFlag : uint8 {
+    Unknown = 0,
+    Maker = 1,
+    Taker = 2,
+    Auction = 3,
+}
+
+enum OrderRejectReason : uint16 {
+    Unknown = 0,
+    RiskLimitBreached = 1,
+    InvalidInstrument = 2,
+    StalePrice = 3,
+    KillSwitchActive = 4,
+    DuplicateClOrdId = 5,
+    NoLocate = 6,
+    SessionNotOpen = 7,
+    BadParameter = 8,
+}
+
+// Fixed-point with 8 decimal places (true_price = raw_e8 / 1e8). Sufficient
+// for equities (4 dp) with headroom for crypto and FX.
+struct Price {
+    raw_e8: int64;
+}
+
+// Integer shares for equities. For fractional / crypto, scale at the
+// reference-data layer rather than in the wire type.
+struct Qty {
+    raw: int64;
+}
+
+// 64-bit identifiers; reference-data resolves them to symbols.
+//   cl_ord_id : (host_id<<48) | (session_id<<32) | monotonic_seq.
+//               Deterministic across HA failover (same id on primary and
+//               standby) — required for in-flight order reconciliation.
+//   exch_ord_id : assigned by venue.
+struct Ids {
+    cl_ord_id: uint64;
+    exch_ord_id: uint64;
+    instrument_id: uint64;
+    venue_id: uint64;
+    account_id: uint64;
+    strategy_id: uint64;
+}
+
+// All timestamps are nanoseconds since UNIX epoch (wall_ns), produced via
+// SystemClock::wall_ns() at the source. Latency analysis stamps every hop.
+struct Timestamps {
+    origin_ns: int64;       // event origin (e.g., venue feed timestamp)
+    ingress_ns: int64;      // time we received it
+    decision_ns: int64;     // time strategy decided (orders only)
+    submit_ns: int64;       // time we sent to venue (orders only)
+}
+
+table OrderNew {
+    ids: Ids (required);
+    side: Side;
+    qty: Qty (required);
+    price: Price (required);   // 0 for Market
+    ord_type: OrdType;
+    tif: TimeInForce;
+    ts: Timestamps (required);
+}
+
+table OrderCancel {
+    ids: Ids (required);       // cl_ord_id of order to cancel; exch_ord_id may be 0 if not yet acked
+    ts: Timestamps (required);
+}
+
+table OrderReplace {
+    ids: Ids (required);
+    new_qty: Qty (required);
+    new_price: Price (required);
+    ts: Timestamps (required);
+}
+
+table OrderAck {
+    ids: Ids (required);
+    ts: Timestamps (required);
+}
+
+table OrderReject {
+    ids: Ids (required);
+    reason: OrderRejectReason;
+    detail: string;            // human-readable, optional
+    ts: Timestamps (required);
+}
+
+table OrderFill {
+    ids: Ids (required);
+    fill_qty: Qty (required);
+    fill_price: Price (required);
+    fee_e8: int64;             // signed; rebates are negative
+    liquidity: LiquidityFlag;
+    ts: Timestamps (required);
+}
+
+table OrderCancelAck {
+    ids: Ids (required);
+    ts: Timestamps (required);
+}
+
+union HotMsg {
+    OrderNew,
+    OrderCancel,
+    OrderReplace,
+    OrderAck,
+    OrderReject,
+    OrderFill,
+    OrderCancelAck,
+}
+
+table MessageEnvelope {
+    schema_major: uint16 = 0;
+    schema_minor: uint16 = 1;
+    seq: uint64;               // per-ring monotonic sequence
+    payload: HotMsg;
+}
+
+root_type MessageEnvelope;
