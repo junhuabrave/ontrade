@@ -45,6 +45,59 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --parallel
 
+  sanitizers:
+    name: cpp-sanitizers / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan, ubsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              cmake ninja-build clang-18
+
+      - name: Configure flags
+        id: flags
+        run: |
+          case "${{ matrix.sanitizer }}" in
+            asan)
+              echo "san_flags=-fsanitize=address,undefined -fno-omit-frame-pointer" >> $GITHUB_OUTPUT
+              ;;
+            tsan)
+              echo "san_flags=-fsanitize=thread -fno-omit-frame-pointer" >> $GITHUB_OUTPUT
+              ;;
+            ubsan)
+              echo "san_flags=-fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Configure
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="${{ steps.flags.outputs.san_flags }}" \
+            -DCMAKE_C_FLAGS="${{ steps.flags.outputs.san_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ steps.flags.outputs.san_flags }}"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --output-on-failure --parallel
+
   python:
     name: python / 3.12
     runs-on: ubuntu-24.04
