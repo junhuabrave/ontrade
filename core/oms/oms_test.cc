@@ -437,6 +437,113 @@ TEST_F(OmsFixture, FillOnUnknownClOrdIdIsForwardedWithoutCrash) {
     EXPECT_EQ(oms_->open_orders(), 0U);
 }
 
+// ---------- stats / observability ----------
+
+TEST_F(OmsFixture, StatsStartsZeroed) {
+    auto s = oms_->stats();
+    EXPECT_EQ(s.open_orders, 0U);
+    EXPECT_EQ(s.pending_new, 0U);
+    EXPECT_EQ(s.working, 0U);
+    EXPECT_EQ(s.partially_filled, 0U);
+    EXPECT_EQ(s.pending_cancel, 0U);
+    EXPECT_EQ(s.position, 0);
+    EXPECT_EQ(s.orders_accepted, 0U);
+    EXPECT_EQ(s.orders_rejected_risk, 0U);
+    EXPECT_EQ(s.orders_rejected_capacity, 0U);
+    EXPECT_EQ(s.fills_received, 0U);
+    EXPECT_EQ(s.cancels_acked, 0U);
+    EXPECT_EQ(s.outbound_drops, 0U);
+}
+
+TEST_F(OmsFixture, StatsCountsAcceptsAndRejects) {
+    push_order_new(Side::Buy, 100, 100'00'000'000, 1);
+    push_order_new(Side::Buy, 200, 100'00'000'000, 2);
+    oms_->poll();
+
+    auto l = permissive_limits();
+    l.kill_switch = 1;
+    oms_->set_limits(l);
+    push_order_new(Side::Buy, 50, 100'00'000'000, 3);
+    oms_->poll();
+
+    auto s = oms_->stats();
+    EXPECT_EQ(s.orders_accepted, 2U);
+    EXPECT_EQ(s.orders_rejected_risk, 1U);
+    EXPECT_EQ(s.orders_rejected_capacity, 0U);
+}
+
+TEST_F(OmsFixture, StatsCountsCapacityRejectsSeparately) {
+    for (std::uint64_t i = 1; i <= kMaxOpen; ++i) {
+        push_order_new(Side::Buy, 10, 100'00'000'000, i);
+    }
+    oms_->poll();
+    push_order_new(Side::Buy, 10, 100'00'000'000, /*cl_ord_id=*/999);
+    oms_->poll();
+
+    auto s = oms_->stats();
+    EXPECT_EQ(s.orders_accepted, kMaxOpen);
+    EXPECT_EQ(s.orders_rejected_risk, 0U);
+    EXPECT_EQ(s.orders_rejected_capacity, 1U);
+}
+
+TEST_F(OmsFixture, StatsBreaksDownInFlightByState) {
+    // #1 Working (acked, no fill); #2 PartiallyFilled; #3 PendingCancel;
+    // #4 PendingNew (no ack yet).
+    for (std::uint64_t i = 1; i <= 4; ++i) {
+        push_order_new(Side::Buy, 100, 100'00'000'000, i);
+    }
+    oms_->poll();
+
+    push_venue_ack(1, 0xA1);
+    push_venue_ack(2, 0xA2);
+    push_venue_ack(3, 0xA3);
+    oms_->poll();
+
+    push_venue_fill(2, 30);  // partial
+    oms_->poll();
+
+    push_order_cancel(3);
+    oms_->poll();
+
+    auto s = oms_->stats();
+    EXPECT_EQ(s.open_orders, 4U);
+    EXPECT_EQ(s.working, 1U);          // #1
+    EXPECT_EQ(s.partially_filled, 1U); // #2
+    EXPECT_EQ(s.pending_cancel, 1U);   // #3
+    EXPECT_EQ(s.pending_new, 1U);      // #4
+}
+
+TEST_F(OmsFixture, StatsCountsFillsAndCancelAcks) {
+    push_order_new(Side::Buy, 100, 100'00'000'000, 1);
+    push_order_new(Side::Buy, 100, 100'00'000'000, 2);
+    oms_->poll();
+
+    push_venue_fill(1, 60);
+    push_venue_fill(1, 40);
+    push_order_cancel(2);
+    oms_->poll();
+    push_venue_cancel_ack(2);
+    oms_->poll();
+
+    auto s = oms_->stats();
+    EXPECT_EQ(s.fills_received, 2U);
+    EXPECT_EQ(s.cancels_acked, 1U);
+    EXPECT_EQ(s.position, 100);
+    EXPECT_EQ(s.open_orders, 0U);
+}
+
+TEST_F(OmsFixture, StatsReportsRingPendingDepths) {
+    // Push two inbound and one venue_in but do NOT poll.
+    push_order_new(Side::Buy, 10, 100'00'000'000, 1);
+    push_order_new(Side::Buy, 10, 100'00'000'000, 2);
+    push_venue_fill(1, 5);
+
+    auto s = oms_->stats();
+    EXPECT_EQ(s.inbound_pending, 2U);
+    EXPECT_EQ(s.venue_in_pending, 1U);
+    EXPECT_EQ(s.outbound_pending, 0U);
+}
+
 TEST_F(OmsFixture, InboundAndVenueInDrainedInSinglePoll) {
     push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/7);
     oms_->poll();

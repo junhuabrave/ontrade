@@ -79,6 +79,36 @@ struct TrackedOrder {
 
 static_assert(sizeof(TrackedOrder) == 40, "TrackedOrder layout");
 
+// Operational snapshot of OMS state. Read by the control plane (paper-
+// trading dashboard, ops UI, paging). Cheap to populate — small struct,
+// counters are plain integers, per-state counts walk the in-flight set
+// (bounded by MaxOpenOrders, fits in cache).
+//
+// Gauges describe "right now"; counters are lifetime monotonic totals
+// (the control plane diffs between samples to get rates).
+struct Stats {
+    // Gauges
+    std::size_t open_orders;
+    std::size_t pending_new;
+    std::size_t working;
+    std::size_t partially_filled;
+    std::size_t pending_cancel;
+    std::int64_t position;
+
+    // Counters (lifetime)
+    std::uint64_t orders_accepted;
+    std::uint64_t orders_rejected_risk;
+    std::uint64_t orders_rejected_capacity;
+    std::uint64_t fills_received;
+    std::uint64_t cancels_acked;
+    std::uint64_t outbound_drops;
+
+    // Ring queue depths (diagnostic; sustained backlog is a red flag)
+    std::uint64_t inbound_pending;
+    std::uint64_t venue_in_pending;
+    std::uint64_t outbound_pending;
+};
+
 template <
     std::size_t InboundSlots,
     std::size_t VenueInSlots,
@@ -109,6 +139,33 @@ public:
     }
     [[nodiscard]] std::uint64_t outbound_drops() const noexcept { return drops_; }
     [[nodiscard]] std::size_t open_orders() const noexcept { return active_count_; }
+
+    // Operational snapshot. Safe to call from the OMS thread between polls;
+    // for cross-thread observation, the OMS owner should publish the result
+    // into a control-plane ring (single-writer, relaxed-atomic publish).
+    [[nodiscard]] Stats stats() const noexcept {
+        Stats s{};
+        s.open_orders = active_count_;
+        s.position = position_.current_qty;
+        for (std::size_t i = 0; i < active_count_; ++i) {
+            switch (active_[i]->state) {
+                case OrderState::PendingNew:      ++s.pending_new; break;
+                case OrderState::Working:         ++s.working; break;
+                case OrderState::PartiallyFilled: ++s.partially_filled; break;
+                case OrderState::PendingCancel:   ++s.pending_cancel; break;
+            }
+        }
+        s.orders_accepted = orders_accepted_;
+        s.orders_rejected_risk = orders_rejected_risk_;
+        s.orders_rejected_capacity = orders_rejected_capacity_;
+        s.fills_received = fills_received_;
+        s.cancels_acked = cancels_acked_;
+        s.outbound_drops = drops_;
+        s.inbound_pending = in_.pending();
+        s.venue_in_pending = venue_in_.pending();
+        s.outbound_pending = out_.pending();
+        return s;
+    }
 
     // Drain inbound (strategy) then venue_in (venue replies). Returns the
     // total number of messages processed in this call.
@@ -191,6 +248,7 @@ private:
         risk_lat_.record(risk_t1 - risk_t0);
 
         if (!outcome.accepted()) {
+            ++orders_rejected_risk_;
             emit_reject(order, outcome.reason);
             return;
         }
@@ -200,9 +258,11 @@ private:
         // forwarding an order we can't account for.
         auto* tracked = orders_pool_.construct();
         if (tracked == nullptr) {
+            ++orders_rejected_capacity_;
             emit_reject(order, proto::hot::OrderRejectReason::RiskLimitBreached);
             return;
         }
+        ++orders_accepted_;
         tracked->cl_ord_id = order.ids.cl_ord_id;
         tracked->exch_ord_id = 0;
         tracked->qty_total = order.qty_raw;
@@ -246,6 +306,7 @@ private:
     }
 
     void handle_order_fill(proto::hot::OrderFill& fill) noexcept {
+        ++fills_received_;
         auto* t = find_by_cl_ord_id(fill.ids.cl_ord_id);
         if (t != nullptr) {
             const auto fq = fill.fill_qty_raw;
@@ -266,6 +327,7 @@ private:
     void handle_order_cancel_ack(proto::hot::OrderCancelAck& ca) noexcept {
         auto* t = find_by_cl_ord_id(ca.ids.cl_ord_id);
         if (t != nullptr) {
+            ++cancels_acked_;
             release(t);
         }
         emit(ca);
@@ -326,6 +388,11 @@ private:
     std::size_t active_count_{0};
     std::uint64_t next_seq_{1};
     std::uint64_t drops_{0};
+    std::uint64_t orders_accepted_{0};
+    std::uint64_t orders_rejected_risk_{0};
+    std::uint64_t orders_rejected_capacity_{0};
+    std::uint64_t fills_received_{0};
+    std::uint64_t cancels_acked_{0};
 };
 
 }  // namespace ontrade::oms
