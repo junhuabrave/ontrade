@@ -78,6 +78,12 @@ enum class MsgType : std::uint16_t {
     OrderReject = 5,
     OrderFill = 6,
     OrderCancelAck = 7,
+
+    // Market-data messages — produced by md-ingress / book-builder, consumed
+    // by strategy-runner. Same wire-format rules as the order-side messages
+    // (fixed offsets, little-endian, no length prefix).
+    BookUpdate = 100,
+    TradeTick = 101,
 };
 
 // 16-byte header, first member of every message struct.
@@ -166,6 +172,41 @@ struct OrderCancelAck {
     Timestamps ts;
 };
 
+// Market-data messages.
+//
+// BookUpdate carries top-of-book state (best bid + best ask, with sizes).
+// L2 / depth carriage is a future extension — would be a separate message
+// type (BookDepth) to keep this slot small. The strategy-runner consumes
+// BookUpdate; book construction from raw L2 events lives in the
+// book-builder process.
+//
+// TradeTick is one trade print on the venue's tape — used for momentum,
+// trade-imbalance, and VWAP computations.
+
+struct BookUpdate {
+    Header hdr;
+    std::uint64_t instrument_id;
+    std::uint64_t venue_id;
+    std::int64_t bid_price_e8;
+    std::int64_t bid_qty_raw;
+    std::int64_t ask_price_e8;
+    std::int64_t ask_qty_raw;
+    std::int64_t origin_ns;    // venue feed timestamp
+    std::int64_t ingress_ns;   // time we received it
+};
+
+struct TradeTick {
+    Header hdr;
+    std::uint64_t instrument_id;
+    std::uint64_t venue_id;
+    std::int64_t price_e8;
+    std::int64_t qty_raw;
+    Side aggressor;            // taker side (Buy = aggressing buyer)
+    std::uint8_t _pad[7];
+    std::int64_t origin_ns;
+    std::int64_t ingress_ns;
+};
+
 // Layout invariants. Any change here is a hard ABI break — bump
 // kSchemaMajor and write an ADR.
 static_assert(sizeof(Header) == 16, "Header layout");
@@ -180,6 +221,9 @@ static_assert(sizeof(OrderReject) == 104, "OrderReject layout");
 static_assert(sizeof(OrderFill) == 128, "OrderFill layout");
 static_assert(sizeof(OrderCancelAck) == 96, "OrderCancelAck layout");
 
+static_assert(sizeof(BookUpdate) == 80, "BookUpdate layout");
+static_assert(sizeof(TradeTick) == 72, "TradeTick layout");
+
 // Shared slot size for any shm ring carrying these hot messages. Sized to
 // fit the largest (OrderFill, 128 bytes) so a single ring can multiplex
 // the full message set without per-type rings. The OMS, gateway, and any
@@ -193,6 +237,8 @@ static_assert(kHotSlotBytes >= sizeof(OrderAck));
 static_assert(kHotSlotBytes >= sizeof(OrderReject));
 static_assert(kHotSlotBytes >= sizeof(OrderFill));
 static_assert(kHotSlotBytes >= sizeof(OrderCancelAck));
+static_assert(kHotSlotBytes >= sizeof(BookUpdate));
+static_assert(kHotSlotBytes >= sizeof(TradeTick));
 
 static_assert(alignof(OrderNew) == 8, "OrderNew alignment");
 static_assert(alignof(OrderFill) == 8, "OrderFill alignment");

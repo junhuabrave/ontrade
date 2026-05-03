@@ -41,3 +41,4 @@ if(ONTRADE_BUILD_TESTS)
 endif()
 
 add_subdirectory(core)
+add_subdirectory(app)

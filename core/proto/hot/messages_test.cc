@@ -17,9 +17,13 @@ static_assert(std::is_trivially_copyable_v<OrderAck>);
 static_assert(std::is_trivially_copyable_v<OrderReject>);
 static_assert(std::is_trivially_copyable_v<OrderFill>);
 static_assert(std::is_trivially_copyable_v<OrderCancelAck>);
+static_assert(std::is_trivially_copyable_v<BookUpdate>);
+static_assert(std::is_trivially_copyable_v<TradeTick>);
 
 static_assert(std::is_standard_layout_v<OrderNew>);
 static_assert(std::is_standard_layout_v<OrderFill>);
+static_assert(std::is_standard_layout_v<BookUpdate>);
+static_assert(std::is_standard_layout_v<TradeTick>);
 
 TEST(HotSchema, VersionConstants) {
     EXPECT_EQ(kSchemaMajor, 1);
