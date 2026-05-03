@@ -30,16 +30,18 @@ class OmsFixture : public ::testing::Test {
 protected:
     using InRing = messaging::SpscRing<kSlotSize, kSlots>;
     using VenueRing = messaging::SpscRing<kSlotSize, kSlots>;
-    using OutRing = messaging::SpscRing<kSlotSize, kSlots>;
-    using OmsType = Oms<kSlots, kSlots, kSlots, kMaxOpen, runtime::MockClock>;
+    using ToVenueRing = messaging::SpscRing<kSlotSize, kSlots>;
+    using EventsRing = messaging::SpscRing<kSlotSize, kSlots>;
+    using OmsType = Oms<kSlots, kSlots, kSlots, kSlots, kMaxOpen, runtime::MockClock>;
 
     void SetUp() override {
         clk_.set_wall(1'000'000);
         clk_.set_now(0);
         in_ = InRing::create(in_storage_.data());
         venue_in_ = VenueRing::create(venue_storage_.data());
-        out_ = OutRing::create(out_storage_.data());
-        oms_ = std::make_unique<OmsType>(in_, venue_in_, out_, clk_);
+        to_venue_ = ToVenueRing::create(to_venue_storage_.data());
+        events_ = EventsRing::create(events_storage_.data());
+        oms_ = std::make_unique<OmsType>(in_, venue_in_, to_venue_, events_, clk_);
         oms_->set_limits(permissive_limits());
     }
 
@@ -134,8 +136,8 @@ protected:
         venue_in_.commit();
     }
 
-    [[nodiscard]] proto::hot::Header peek_outbound_header() {
-        const auto* slot = out_.try_read();
+    [[nodiscard]] proto::hot::Header peek_to_venue_header() {
+        const auto* slot = to_venue_.try_read();
         if (slot == nullptr) return {};
         proto::hot::Header h{};
         std::memcpy(&h, slot, sizeof(h));
@@ -143,26 +145,41 @@ protected:
     }
 
     template <typename Msg>
-    [[nodiscard]] Msg read_outbound() {
-        const auto* slot = out_.try_read();
+    [[nodiscard]] Msg read_to_venue() {
+        const auto* slot = to_venue_.try_read();
         EXPECT_NE(slot, nullptr);
         Msg m{};
         std::memcpy(&m, slot, sizeof(m));
-        out_.release();
+        to_venue_.release();
         return m;
     }
 
-    void drain_outbound() {
-        while (out_.try_read()) out_.release();
+    template <typename Msg>
+    [[nodiscard]] Msg read_event() {
+        const auto* slot = events_.try_read();
+        EXPECT_NE(slot, nullptr);
+        Msg m{};
+        std::memcpy(&m, slot, sizeof(m));
+        events_.release();
+        return m;
+    }
+
+    void drain_to_venue() {
+        while (to_venue_.try_read()) to_venue_.release();
+    }
+    void drain_events() {
+        while (events_.try_read()) events_.release();
     }
 
     runtime::MockClock clk_;
     alignas(64) std::array<std::byte, InRing::kStorageBytes> in_storage_{};
     alignas(64) std::array<std::byte, VenueRing::kStorageBytes> venue_storage_{};
-    alignas(64) std::array<std::byte, OutRing::kStorageBytes> out_storage_{};
+    alignas(64) std::array<std::byte, ToVenueRing::kStorageBytes> to_venue_storage_{};
+    alignas(64) std::array<std::byte, EventsRing::kStorageBytes> events_storage_{};
     InRing in_{InRing::attach(in_storage_.data())};
     VenueRing venue_in_{VenueRing::attach(venue_storage_.data())};
-    OutRing out_{OutRing::attach(out_storage_.data())};
+    ToVenueRing to_venue_{ToVenueRing::attach(to_venue_storage_.data())};
+    EventsRing events_{EventsRing::attach(events_storage_.data())};
     std::unique_ptr<OmsType> oms_;
     std::uint64_t next_in_seq_{1};
     std::uint64_t next_venue_seq_{1};
@@ -177,12 +194,14 @@ TEST_F(OmsFixture, AcceptedOrderForwardedAsOrderNew) {
     EXPECT_EQ(oms_->poll(), 1U);
     EXPECT_EQ(oms_->open_orders(), 1U);
 
-    EXPECT_EQ(peek_outbound_header().msg_type,
+    EXPECT_EQ(peek_to_venue_header().msg_type,
               static_cast<std::uint16_t>(MsgType::OrderNew));
-    auto fwd = read_outbound<OrderNew>();
+    auto fwd = read_to_venue<OrderNew>();
     EXPECT_EQ(fwd.ids.cl_ord_id, 1U);
     EXPECT_EQ(fwd.qty_raw, 100);
     EXPECT_EQ(fwd.price_raw_e8, 100'00'000'000);
+    // The events ring should be empty for an accepted-and-forwarded order.
+    EXPECT_EQ(events_.try_read(), nullptr);
 }
 
 TEST_F(OmsFixture, AcceptedOrderHasSubmitStamped) {
@@ -191,14 +210,14 @@ TEST_F(OmsFixture, AcceptedOrderHasSubmitStamped) {
     clk_.set_wall(7'778'000);
     oms_->poll();
 
-    auto fwd = read_outbound<OrderNew>();
+    auto fwd = read_to_venue<OrderNew>();
     EXPECT_EQ(fwd.ts.submit_ns, 7'778'000);
     EXPECT_EQ(fwd.ts.decision_ns, 7'778'000);
     EXPECT_EQ(fwd.ts.origin_ns, 7'777'777);
     EXPECT_EQ(fwd.ts.ingress_ns, 7'777'777);
 }
 
-TEST_F(OmsFixture, KillSwitchEmitsReject) {
+TEST_F(OmsFixture, KillSwitchEmitsRejectOnEvents) {
     auto l = permissive_limits();
     l.kill_switch = 1;
     oms_->set_limits(l);
@@ -206,11 +225,13 @@ TEST_F(OmsFixture, KillSwitchEmitsReject) {
     push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/42);
     oms_->poll();
 
-    auto rej = read_outbound<OrderReject>();
+    auto rej = read_event<OrderReject>();
     EXPECT_EQ(rej.hdr.msg_type, static_cast<std::uint16_t>(MsgType::OrderReject));
     EXPECT_EQ(rej.ids.cl_ord_id, 42U);
     EXPECT_EQ(rej.reason, OrderRejectReason::KillSwitchActive);
-    EXPECT_EQ(oms_->open_orders(), 0U);  // rejected orders are not tracked
+    EXPECT_EQ(oms_->open_orders(), 0U);
+    // Rejected orders never reach the venue.
+    EXPECT_EQ(to_venue_.try_read(), nullptr);
 }
 
 TEST_F(OmsFixture, ShortWithoutLocateRejectsWithNoLocate) {
@@ -221,7 +242,7 @@ TEST_F(OmsFixture, ShortWithoutLocateRejectsWithNoLocate) {
     push_order_new(Side::Sell, 100, 100'00'000'000);
     oms_->poll();
 
-    auto rej = read_outbound<OrderReject>();
+    auto rej = read_event<OrderReject>();
     EXPECT_EQ(rej.reason, OrderRejectReason::NoLocate);
 }
 
@@ -242,7 +263,7 @@ TEST_F(OmsFixture, PositionUpdateAffectsCheck) {
     push_order_new(Side::Buy, 100, 100'00'000'000);
     oms_->poll();
 
-    auto rej = read_outbound<OrderReject>();
+    auto rej = read_event<OrderReject>();
     EXPECT_EQ(rej.reason, OrderRejectReason::RiskLimitBreached);
 }
 
@@ -254,24 +275,45 @@ TEST_F(OmsFixture, MultipleOrdersAllProcessedInSinglePoll) {
     EXPECT_EQ(oms_->open_orders(), 5U);
 
     for (std::uint64_t i = 1; i <= 5; ++i) {
-        auto fwd = read_outbound<OrderNew>();
+        auto fwd = read_to_venue<OrderNew>();
         EXPECT_EQ(fwd.ids.cl_ord_id, i);
     }
 }
 
-TEST_F(OmsFixture, OutboundFullIncrementsDrops) {
+TEST_F(OmsFixture, ToVenueFullIncrementsToVenueDrops) {
     for (std::size_t i = 0; i < kSlots; ++i) {
-        auto* slot = out_.try_claim();
+        auto* slot = to_venue_.try_claim();
         ASSERT_NE(slot, nullptr);
         std::memset(slot, 0, kSlotSize);
-        out_.commit();
+        to_venue_.commit();
     }
-    EXPECT_EQ(out_.try_claim(), nullptr);
+    EXPECT_EQ(to_venue_.try_claim(), nullptr);
 
     push_order_new(Side::Buy, 100, 100'00'000'000);
     oms_->poll();
 
-    EXPECT_EQ(oms_->outbound_drops(), 1U);
+    EXPECT_EQ(oms_->to_venue_drops(), 1U);
+    EXPECT_EQ(oms_->event_drops(), 0U);
+}
+
+TEST_F(OmsFixture, EventsFullIncrementsEventDrops) {
+    auto l = permissive_limits();
+    l.kill_switch = 1;
+    oms_->set_limits(l);
+
+    for (std::size_t i = 0; i < kSlots; ++i) {
+        auto* slot = events_.try_claim();
+        ASSERT_NE(slot, nullptr);
+        std::memset(slot, 0, kSlotSize);
+        events_.commit();
+    }
+    EXPECT_EQ(events_.try_claim(), nullptr);
+
+    push_order_new(Side::Buy, 100, 100'00'000'000);
+    oms_->poll();
+
+    EXPECT_EQ(oms_->event_drops(), 1U);
+    EXPECT_EQ(oms_->to_venue_drops(), 0U);
 }
 
 TEST_F(OmsFixture, NonOrderNewMessagesAreSkipped) {
@@ -287,28 +329,31 @@ TEST_F(OmsFixture, NonOrderNewMessagesAreSkipped) {
     in_.commit();
 
     EXPECT_EQ(oms_->poll(), 1U);
-    EXPECT_EQ(out_.try_read(), nullptr);
+    EXPECT_EQ(to_venue_.try_read(), nullptr);
+    EXPECT_EQ(events_.try_read(), nullptr);
 }
 
 // ---------- order-state machine tests ----------
 
-TEST_F(OmsFixture, VenueAckIsForwardedToOutbound) {
+TEST_F(OmsFixture, VenueAckIsForwardedToEvents) {
     push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/7);
     oms_->poll();
-    drain_outbound();
+    drain_to_venue();
 
     push_venue_ack(/*cl_ord_id=*/7, /*exch_ord_id=*/0xDEAD);
     EXPECT_EQ(oms_->poll(), 1U);
 
-    auto a = read_outbound<OrderAck>();
+    auto a = read_event<OrderAck>();
     EXPECT_EQ(a.ids.cl_ord_id, 7U);
     EXPECT_EQ(a.ids.exch_ord_id, 0xDEADU);
+    // Acks do not loop back to the venue.
+    EXPECT_EQ(to_venue_.try_read(), nullptr);
 }
 
 TEST_F(OmsFixture, FullFillReleasesPoolSlotAndUpdatesPosition) {
     push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/7);
     oms_->poll();
-    drain_outbound();
+    drain_to_venue();
 
     EXPECT_EQ(oms_->open_orders(), 1U);
     EXPECT_EQ(oms_->position(), 0);
@@ -324,7 +369,7 @@ TEST_F(OmsFixture, FullFillReleasesPoolSlotAndUpdatesPosition) {
 TEST_F(OmsFixture, PartialFillKeepsOrderOpen) {
     push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/7);
     oms_->poll();
-    drain_outbound();
+    drain_to_venue();
 
     push_venue_ack(7, 0xBEEF);
     push_venue_fill(7, 30);
@@ -345,7 +390,7 @@ TEST_F(OmsFixture, SellFillDecrementsPosition) {
 
     push_order_new(Side::Sell, 200, 100'00'000'000, /*cl_ord_id=*/9);
     oms_->poll();
-    drain_outbound();
+    drain_to_venue();
 
     push_venue_fill(9, 200);
     oms_->poll();
@@ -356,19 +401,19 @@ TEST_F(OmsFixture, SellFillDecrementsPosition) {
 TEST_F(OmsFixture, OrderCancelForwardedWithExchOrdId) {
     push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/7);
     oms_->poll();
-    drain_outbound();
+    drain_to_venue();
 
     push_venue_ack(7, /*exch_ord_id=*/0xCAFE);
     oms_->poll();
-    drain_outbound();
+    drain_events();
 
     push_order_cancel(7);
     EXPECT_EQ(oms_->poll(), 1U);
 
-    auto c = read_outbound<OrderCancel>();
+    auto c = read_to_venue<OrderCancel>();
     EXPECT_EQ(c.ids.cl_ord_id, 7U);
     EXPECT_EQ(c.ids.exch_ord_id, 0xCAFEU);
-    EXPECT_EQ(oms_->open_orders(), 1U);  // still tracked until cancel-ack
+    EXPECT_EQ(oms_->open_orders(), 1U);
 }
 
 TEST_F(OmsFixture, CancelAckReleasesPoolSlot) {
@@ -376,7 +421,7 @@ TEST_F(OmsFixture, CancelAckReleasesPoolSlot) {
     oms_->poll();
     push_order_cancel(7);
     oms_->poll();
-    drain_outbound();
+    drain_to_venue();
 
     EXPECT_EQ(oms_->open_orders(), 1U);
 
@@ -384,14 +429,15 @@ TEST_F(OmsFixture, CancelAckReleasesPoolSlot) {
     oms_->poll();
 
     EXPECT_EQ(oms_->open_orders(), 0U);
-    auto ca = read_outbound<OrderCancelAck>();
+    auto ca = read_event<OrderCancelAck>();
     EXPECT_EQ(ca.ids.cl_ord_id, 7U);
 }
 
 TEST_F(OmsFixture, CancelOnUnknownClOrdIdIsSilentlyDropped) {
     push_order_cancel(/*cl_ord_id=*/9999);
     EXPECT_EQ(oms_->poll(), 1U);
-    EXPECT_EQ(out_.try_read(), nullptr);
+    EXPECT_EQ(to_venue_.try_read(), nullptr);
+    EXPECT_EQ(events_.try_read(), nullptr);
 }
 
 TEST_F(OmsFixture, DuplicateCancelIsIgnoredAfterPendingCancel) {
@@ -399,42 +445,53 @@ TEST_F(OmsFixture, DuplicateCancelIsIgnoredAfterPendingCancel) {
     oms_->poll();
     push_order_cancel(7);
     oms_->poll();
-    drain_outbound();
+    drain_to_venue();
 
     push_order_cancel(7);
     EXPECT_EQ(oms_->poll(), 1U);
-    EXPECT_EQ(out_.try_read(), nullptr);  // duplicate dropped
+    EXPECT_EQ(to_venue_.try_read(), nullptr);
 }
 
 TEST_F(OmsFixture, PoolExhaustionEmitsRejectAndDoesNotForward) {
-    // Fill the pool with kMaxOpen working orders.
     for (std::uint64_t i = 1; i <= kMaxOpen; ++i) {
         push_order_new(Side::Buy, 10, 100'00'000'000, i);
     }
     oms_->poll();
     EXPECT_EQ(oms_->open_orders(), kMaxOpen);
-    drain_outbound();
+    drain_to_venue();
 
-    // The next OrderNew passes risk but should be rejected for capacity.
     push_order_new(Side::Buy, 10, 100'00'000'000, /*cl_ord_id=*/999);
     oms_->poll();
 
-    auto rej = read_outbound<OrderReject>();
+    auto rej = read_event<OrderReject>();
     EXPECT_EQ(rej.ids.cl_ord_id, 999U);
     EXPECT_EQ(rej.reason, OrderRejectReason::RiskLimitBreached);
     EXPECT_EQ(oms_->open_orders(), kMaxOpen);
+    EXPECT_EQ(to_venue_.try_read(), nullptr);
 }
 
 TEST_F(OmsFixture, FillOnUnknownClOrdIdIsForwardedWithoutCrash) {
-    // Defensive: a fill arriving with no matching tracked order should still
-    // be forwarded (so post-trade can see it) without disturbing OMS state.
     push_venue_fill(/*cl_ord_id=*/12345, 50);
     oms_->poll();
 
-    auto f = read_outbound<OrderFill>();
+    auto f = read_event<OrderFill>();
     EXPECT_EQ(f.ids.cl_ord_id, 12345U);
     EXPECT_EQ(oms_->position(), 0);
     EXPECT_EQ(oms_->open_orders(), 0U);
+}
+
+TEST_F(OmsFixture, InboundAndVenueInDrainedInSinglePoll) {
+    push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/7);
+    oms_->poll();
+    drain_to_venue();
+
+    push_order_new(Side::Buy, 50, 100'00'000'000, /*cl_ord_id=*/8);
+    push_venue_ack(7, 0xAAA);
+    push_venue_fill(7, 100);
+    EXPECT_EQ(oms_->poll(), 3U);
+
+    EXPECT_EQ(oms_->open_orders(), 1U);
+    EXPECT_EQ(oms_->position(), 100);
 }
 
 // ---------- stats / observability ----------
@@ -452,7 +509,8 @@ TEST_F(OmsFixture, StatsStartsZeroed) {
     EXPECT_EQ(s.orders_rejected_capacity, 0U);
     EXPECT_EQ(s.fills_received, 0U);
     EXPECT_EQ(s.cancels_acked, 0U);
-    EXPECT_EQ(s.outbound_drops, 0U);
+    EXPECT_EQ(s.to_venue_drops, 0U);
+    EXPECT_EQ(s.event_drops, 0U);
 }
 
 TEST_F(OmsFixture, StatsCountsAcceptsAndRejects) {
@@ -487,8 +545,6 @@ TEST_F(OmsFixture, StatsCountsCapacityRejectsSeparately) {
 }
 
 TEST_F(OmsFixture, StatsBreaksDownInFlightByState) {
-    // #1 Working (acked, no fill); #2 PartiallyFilled; #3 PendingCancel;
-    // #4 PendingNew (no ack yet).
     for (std::uint64_t i = 1; i <= 4; ++i) {
         push_order_new(Side::Buy, 100, 100'00'000'000, i);
     }
@@ -499,7 +555,7 @@ TEST_F(OmsFixture, StatsBreaksDownInFlightByState) {
     push_venue_ack(3, 0xA3);
     oms_->poll();
 
-    push_venue_fill(2, 30);  // partial
+    push_venue_fill(2, 30);
     oms_->poll();
 
     push_order_cancel(3);
@@ -507,10 +563,10 @@ TEST_F(OmsFixture, StatsBreaksDownInFlightByState) {
 
     auto s = oms_->stats();
     EXPECT_EQ(s.open_orders, 4U);
-    EXPECT_EQ(s.working, 1U);          // #1
-    EXPECT_EQ(s.partially_filled, 1U); // #2
-    EXPECT_EQ(s.pending_cancel, 1U);   // #3
-    EXPECT_EQ(s.pending_new, 1U);      // #4
+    EXPECT_EQ(s.working, 1U);
+    EXPECT_EQ(s.partially_filled, 1U);
+    EXPECT_EQ(s.pending_cancel, 1U);
+    EXPECT_EQ(s.pending_new, 1U);
 }
 
 TEST_F(OmsFixture, StatsCountsFillsAndCancelAcks) {
@@ -533,7 +589,6 @@ TEST_F(OmsFixture, StatsCountsFillsAndCancelAcks) {
 }
 
 TEST_F(OmsFixture, StatsReportsRingPendingDepths) {
-    // Push two inbound and one venue_in but do NOT poll.
     push_order_new(Side::Buy, 10, 100'00'000'000, 1);
     push_order_new(Side::Buy, 10, 100'00'000'000, 2);
     push_venue_fill(1, 5);
@@ -541,21 +596,8 @@ TEST_F(OmsFixture, StatsReportsRingPendingDepths) {
     auto s = oms_->stats();
     EXPECT_EQ(s.inbound_pending, 2U);
     EXPECT_EQ(s.venue_in_pending, 1U);
-    EXPECT_EQ(s.outbound_pending, 0U);
-}
-
-TEST_F(OmsFixture, InboundAndVenueInDrainedInSinglePoll) {
-    push_order_new(Side::Buy, 100, 100'00'000'000, /*cl_ord_id=*/7);
-    oms_->poll();
-    drain_outbound();
-
-    push_order_new(Side::Buy, 50, 100'00'000'000, /*cl_ord_id=*/8);
-    push_venue_ack(7, 0xAAA);
-    push_venue_fill(7, 100);
-    EXPECT_EQ(oms_->poll(), 3U);
-
-    EXPECT_EQ(oms_->open_orders(), 1U);  // only #8 remains
-    EXPECT_EQ(oms_->position(), 100);
+    EXPECT_EQ(s.to_venue_pending, 0U);
+    EXPECT_EQ(s.events_pending, 0U);
 }
 
 }  // namespace

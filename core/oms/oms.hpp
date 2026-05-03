@@ -3,16 +3,21 @@
 // Order-state-tracking OMS — the first integration point for the hot-path
 // contracts (shm rings + hot messages + clock + latency + risk + object pool).
 //
-// Pipeline:
-//   strategy ─inbound─▶ OMS ─outbound─▶ venue
-//   venue    ─venue_in─▶ OMS ─outbound─▶ strategy / post-trade
+// Pipeline (four rings):
+//   strategy ─inbound─▶ OMS ─to_venue─▶ gateway/venue
+//   venue    ─venue_in─▶ OMS ─events──▶ strategy / post-trade / archiver
+//
+// The split between to_venue and events matters: each is an SPSC ring with a
+// single consumer, so a venue-bound stream cannot share its slots with the
+// downstream event stream that strategy and post-trade tap. Splitting also
+// gives separate backpressure signals — a stuck gateway (to_venue full) is a
+// different incident from a stuck downstream consumer (events full).
 //
 // The OMS owns:
-//   - inbound ring  : OrderNew / OrderCancel from strategy
-//   - venue_in ring : OrderAck / OrderFill / OrderCancelAck from venue
-//   - outbound ring : everything the OMS emits (forwarded order intents to the
-//                     venue, forwarded venue events to downstream, and locally
-//                     synthesized rejects)
+//   - inbound  : OrderNew / OrderCancel from strategy
+//   - venue_in : OrderAck / OrderFill / OrderCancelAck from venue
+//   - to_venue : OrderNew / OrderCancel emitted to the gateway
+//   - events   : OrderReject (synthesized) + forwarded OrderAck/Fill/CancelAck
 //   - tracked-order pool : per-order state for the in-flight set, in a fixed
 //                          object pool (no heap on the order path)
 //
@@ -47,17 +52,9 @@
 
 namespace ontrade::oms {
 
-// Slot size shared by all three rings. OrderFill (128 bytes) is the largest
-// hot message any ring carries; sizing slots to 128 fits any of OrderNew /
-// OrderCancel / OrderReject / OrderAck / OrderFill / OrderCancelAck exactly.
-inline constexpr std::size_t kSlotSize = 128;
-
-static_assert(kSlotSize >= sizeof(proto::hot::OrderNew));
-static_assert(kSlotSize >= sizeof(proto::hot::OrderCancel));
-static_assert(kSlotSize >= sizeof(proto::hot::OrderReject));
-static_assert(kSlotSize >= sizeof(proto::hot::OrderAck));
-static_assert(kSlotSize >= sizeof(proto::hot::OrderFill));
-static_assert(kSlotSize >= sizeof(proto::hot::OrderCancelAck));
+// Slot size for the OMS rings — re-exported from proto::hot so callers
+// constructing rings against this OMS can use a single name.
+inline constexpr std::size_t kSlotSize = proto::hot::kHotSlotBytes;
 
 enum class OrderState : std::uint8_t {
     PendingNew = 0,       // sent to venue, awaiting ack
@@ -101,29 +98,34 @@ struct Stats {
     std::uint64_t orders_rejected_capacity;
     std::uint64_t fills_received;
     std::uint64_t cancels_acked;
-    std::uint64_t outbound_drops;
+    std::uint64_t to_venue_drops;
+    std::uint64_t event_drops;
 
     // Ring queue depths (diagnostic; sustained backlog is a red flag)
     std::uint64_t inbound_pending;
     std::uint64_t venue_in_pending;
-    std::uint64_t outbound_pending;
+    std::uint64_t to_venue_pending;
+    std::uint64_t events_pending;
 };
 
 template <
     std::size_t InboundSlots,
     std::size_t VenueInSlots,
-    std::size_t OutboundSlots,
+    std::size_t ToVenueSlots,
+    std::size_t EventsSlots,
     std::size_t MaxOpenOrders = 1024,
     runtime::ClockLike Clock = runtime::SystemClock>
 class Oms {
 public:
     using Inbound = messaging::SpscRing<kSlotSize, InboundSlots>;
     using VenueIn = messaging::SpscRing<kSlotSize, VenueInSlots>;
-    using Outbound = messaging::SpscRing<kSlotSize, OutboundSlots>;
+    using ToVenue = messaging::SpscRing<kSlotSize, ToVenueSlots>;
+    using Events = messaging::SpscRing<kSlotSize, EventsSlots>;
 
-    Oms(Inbound& inbound, VenueIn& venue_in, Outbound& outbound,
+    Oms(Inbound& inbound, VenueIn& venue_in, ToVenue& to_venue, Events& events,
         const Clock& clk) noexcept
-        : in_(inbound), venue_in_(venue_in), out_(outbound), clk_(clk) {}
+        : in_(inbound), venue_in_(venue_in), to_venue_(to_venue),
+          events_(events), clk_(clk) {}
 
     Oms(const Oms&) = delete;
     Oms& operator=(const Oms&) = delete;
@@ -137,7 +139,8 @@ public:
     [[nodiscard]] const runtime::LatencyHistogram& risk_latency() const noexcept {
         return risk_lat_;
     }
-    [[nodiscard]] std::uint64_t outbound_drops() const noexcept { return drops_; }
+    [[nodiscard]] std::uint64_t to_venue_drops() const noexcept { return to_venue_drops_; }
+    [[nodiscard]] std::uint64_t event_drops() const noexcept { return event_drops_; }
     [[nodiscard]] std::size_t open_orders() const noexcept { return active_count_; }
 
     // Operational snapshot. Safe to call from the OMS thread between polls;
@@ -160,10 +163,12 @@ public:
         s.orders_rejected_capacity = orders_rejected_capacity_;
         s.fills_received = fills_received_;
         s.cancels_acked = cancels_acked_;
-        s.outbound_drops = drops_;
+        s.to_venue_drops = to_venue_drops_;
+        s.event_drops = event_drops_;
         s.inbound_pending = in_.pending();
         s.venue_in_pending = venue_in_.pending();
-        s.outbound_pending = out_.pending();
+        s.to_venue_pending = to_venue_.pending();
+        s.events_pending = events_.pending();
         return s;
     }
 
@@ -272,7 +277,7 @@ private:
         active_[active_count_++] = tracked;
 
         runtime::stamp_hop(order.ts, runtime::HopStamp::Submit, clk_);
-        emit(order);
+        emit_to_venue(order);
     }
 
     void handle_order_cancel(proto::hot::OrderCancel& cancel) noexcept {
@@ -290,7 +295,7 @@ private:
         // Echo the venue's exch_ord_id forward so the gateway can address it.
         cancel.ids.exch_ord_id = t->exch_ord_id;
         runtime::stamp_hop(cancel.ts, runtime::HopStamp::Submit, clk_);
-        emit(cancel);
+        emit_to_venue(cancel);
     }
 
     void handle_order_ack(proto::hot::OrderAck& ack) noexcept {
@@ -302,7 +307,7 @@ private:
             }
         }
         // Forward to downstream regardless — strategy / post-trade need it.
-        emit(ack);
+        emit_event(ack);
     }
 
     void handle_order_fill(proto::hot::OrderFill& fill) noexcept {
@@ -321,7 +326,7 @@ private:
                 t->state = OrderState::PartiallyFilled;
             }
         }
-        emit(fill);
+        emit_event(fill);
     }
 
     void handle_order_cancel_ack(proto::hot::OrderCancelAck& ca) noexcept {
@@ -330,7 +335,7 @@ private:
             ++cancels_acked_;
             release(t);
         }
-        emit(ca);
+        emit_event(ca);
     }
 
     void emit_reject(const proto::hot::OrderNew& order,
@@ -342,18 +347,28 @@ private:
         rej.ids = order.ids;
         rej.reason = reason;
         rej.ts = order.ts;
-        emit(rej);
+        emit_event(rej);
     }
 
     template <typename Msg>
-    void emit(const Msg& m) noexcept {
-        auto* slot = out_.try_claim();
+    void emit_to_venue(const Msg& m) noexcept {
+        emit_into(to_venue_, m, to_venue_drops_);
+    }
+
+    template <typename Msg>
+    void emit_event(const Msg& m) noexcept {
+        emit_into(events_, m, event_drops_);
+    }
+
+    template <typename Ring, typename Msg>
+    void emit_into(Ring& ring, const Msg& m, std::uint64_t& drops) noexcept {
+        auto* slot = ring.try_claim();
         if (slot == nullptr) {
-            ++drops_;
+            ++drops;
             return;
         }
         std::memcpy(slot, &m, sizeof(Msg));
-        out_.commit();
+        ring.commit();
     }
 
     [[nodiscard]] TrackedOrder* find_by_cl_ord_id(std::uint64_t id) noexcept {
@@ -378,7 +393,8 @@ private:
 
     Inbound& in_;
     VenueIn& venue_in_;
-    Outbound& out_;
+    ToVenue& to_venue_;
+    Events& events_;
     const Clock& clk_;
     risk::Limits limits_{};
     risk::PositionView position_{};
@@ -387,7 +403,8 @@ private:
     std::array<TrackedOrder*, MaxOpenOrders> active_{};
     std::size_t active_count_{0};
     std::uint64_t next_seq_{1};
-    std::uint64_t drops_{0};
+    std::uint64_t to_venue_drops_{0};
+    std::uint64_t event_drops_{0};
     std::uint64_t orders_accepted_{0};
     std::uint64_t orders_rejected_risk_{0};
     std::uint64_t orders_rejected_capacity_{0};

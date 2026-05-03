@@ -180,6 +180,20 @@ static_assert(sizeof(OrderReject) == 104, "OrderReject layout");
 static_assert(sizeof(OrderFill) == 128, "OrderFill layout");
 static_assert(sizeof(OrderCancelAck) == 96, "OrderCancelAck layout");
 
+// Shared slot size for any shm ring carrying these hot messages. Sized to
+// fit the largest (OrderFill, 128 bytes) so a single ring can multiplex
+// the full message set without per-type rings. The OMS, gateway, and any
+// future strategy-runner peer all use this constant; do not bump without
+// considering padding cost on smaller messages.
+inline constexpr std::size_t kHotSlotBytes = 128;
+static_assert(kHotSlotBytes >= sizeof(OrderNew));
+static_assert(kHotSlotBytes >= sizeof(OrderCancel));
+static_assert(kHotSlotBytes >= sizeof(OrderReplace));
+static_assert(kHotSlotBytes >= sizeof(OrderAck));
+static_assert(kHotSlotBytes >= sizeof(OrderReject));
+static_assert(kHotSlotBytes >= sizeof(OrderFill));
+static_assert(kHotSlotBytes >= sizeof(OrderCancelAck));
+
 static_assert(alignof(OrderNew) == 8, "OrderNew alignment");
 static_assert(alignof(OrderFill) == 8, "OrderFill alignment");
 
