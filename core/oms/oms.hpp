@@ -1,27 +1,44 @@
 #pragma once
 
-// Minimal OMS skeleton — the first component that integrates the hot-path
-// contracts: shm rings carry hot messages, the risk gate runs inline, the
-// latency histogram records the cost of the gate, and timestamps populate
-// the `Timestamps` field on every emitted message.
+// Order-state-tracking OMS — the first integration point for the hot-path
+// contracts (shm rings + hot messages + clock + latency + risk + object pool).
 //
-// Scope (intentionally small):
-//   - Accepts OrderNew on the inbound ring.
-//   - Runs check_pre_trade; on accept, forwards OrderNew with submit_ns
-//     stamped to the outbound ring; on reject, emits an OrderReject.
-//   - No order-state tracking yet — that lands with the OrderAck path.
-//   - No cancel / replace / fill handling — same.
+// Pipeline:
+//   strategy ─inbound─▶ OMS ─outbound─▶ venue
+//   venue    ─venue_in─▶ OMS ─outbound─▶ strategy / post-trade
 //
-// Threading: the OMS is single-threaded and pinned to one isolated core
-// in production. poll() drains the inbound ring; the caller drives the
-// poll loop. Limits and position are mutated from the same thread (or
-// at session boundaries from the control plane via a published-snapshot
-// mechanism that lands later).
+// The OMS owns:
+//   - inbound ring  : OrderNew / OrderCancel from strategy
+//   - venue_in ring : OrderAck / OrderFill / OrderCancelAck from venue
+//   - outbound ring : everything the OMS emits (forwarded order intents to the
+//                     venue, forwarded venue events to downstream, and locally
+//                     synthesized rejects)
+//   - tracked-order pool : per-order state for the in-flight set, in a fixed
+//                          object pool (no heap on the order path)
+//
+// State machine (per cl_ord_id):
+//   PendingNew ─OrderAck─▶ Working ─OrderFill(remaining>0)─▶ PartiallyFilled
+//   Working / PartiallyFilled ─OrderFill(remaining=0)─▶ (release)
+//   Working / PartiallyFilled ─OrderCancel(in)─▶ PendingCancel
+//   PendingCancel ─OrderCancelAck─▶ (release)
+//
+// What is NOT here yet (deliberate):
+//   - replace handling
+//   - venue-side OrderReject ingestion (we synthesize rejects for risk
+//     failures; the path for venue-originated rejects lands when we wire a
+//     real gateway)
+//   - cancel-on-disconnect / session lifecycle
+//   - HA handoff via Aeron archive replay
+//
+// Threading: single-threaded, pinned to one isolated core. poll() drains the
+// inbound ring then the venue_in ring; the caller drives the loop.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
+#include "core/memory/pool.hpp"
 #include "core/messaging/shm_ring.hpp"
 #include "core/proto/hot/messages.hpp"
 #include "core/risk/limits.hpp"
@@ -30,24 +47,53 @@
 
 namespace ontrade::oms {
 
-// Slot size shared by inbound and outbound rings. OrderFill (128 bytes) is
-// the largest hot message we ever expect a ring to carry; sizing slots to
-// 128 fits any of OrderNew / OrderReject / OrderAck / OrderFill exactly.
+// Slot size shared by all three rings. OrderFill (128 bytes) is the largest
+// hot message any ring carries; sizing slots to 128 fits any of OrderNew /
+// OrderCancel / OrderReject / OrderAck / OrderFill / OrderCancelAck exactly.
 inline constexpr std::size_t kSlotSize = 128;
 
 static_assert(kSlotSize >= sizeof(proto::hot::OrderNew));
+static_assert(kSlotSize >= sizeof(proto::hot::OrderCancel));
 static_assert(kSlotSize >= sizeof(proto::hot::OrderReject));
 static_assert(kSlotSize >= sizeof(proto::hot::OrderAck));
 static_assert(kSlotSize >= sizeof(proto::hot::OrderFill));
+static_assert(kSlotSize >= sizeof(proto::hot::OrderCancelAck));
 
-template <std::size_t InboundSlots, std::size_t OutboundSlots, runtime::ClockLike Clock = runtime::SystemClock>
+enum class OrderState : std::uint8_t {
+    PendingNew = 0,       // sent to venue, awaiting ack
+    Working = 1,          // venue ack'd, no fills yet
+    PartiallyFilled = 2,  // at least one partial, more to come
+    PendingCancel = 3,    // cancel sent, awaiting cancel-ack
+};
+
+// Per-order state stored in the OMS pool. Compact POD; no heap, no vtable.
+struct TrackedOrder {
+    std::uint64_t cl_ord_id;
+    std::uint64_t exch_ord_id;  // 0 until OrderAck arrives
+    std::int64_t qty_total;
+    std::int64_t qty_filled;
+    proto::hot::Side side;
+    OrderState state;
+    std::uint8_t _pad[6];
+};
+
+static_assert(sizeof(TrackedOrder) == 40, "TrackedOrder layout");
+
+template <
+    std::size_t InboundSlots,
+    std::size_t VenueInSlots,
+    std::size_t OutboundSlots,
+    std::size_t MaxOpenOrders = 1024,
+    runtime::ClockLike Clock = runtime::SystemClock>
 class Oms {
 public:
     using Inbound = messaging::SpscRing<kSlotSize, InboundSlots>;
+    using VenueIn = messaging::SpscRing<kSlotSize, VenueInSlots>;
     using Outbound = messaging::SpscRing<kSlotSize, OutboundSlots>;
 
-    Oms(Inbound& inbound, Outbound& outbound, const Clock& clk) noexcept
-        : in_(inbound), out_(outbound), clk_(clk) {}
+    Oms(Inbound& inbound, VenueIn& venue_in, Outbound& outbound,
+        const Clock& clk) noexcept
+        : in_(inbound), venue_in_(venue_in), out_(outbound), clk_(clk) {}
 
     Oms(const Oms&) = delete;
     Oms& operator=(const Oms&) = delete;
@@ -62,50 +108,179 @@ public:
         return risk_lat_;
     }
     [[nodiscard]] std::uint64_t outbound_drops() const noexcept { return drops_; }
+    [[nodiscard]] std::size_t open_orders() const noexcept { return active_count_; }
 
-    // Drain the inbound ring; for each OrderNew, run pre-trade and emit
-    // accept (forwarded OrderNew) or reject. Returns the number of inbound
-    // messages processed in this call.
+    // Drain inbound (strategy) then venue_in (venue replies). Returns the
+    // total number of messages processed in this call.
     std::size_t poll() noexcept {
         std::size_t processed = 0;
-        while (const auto* slot = in_.try_read()) {
-            proto::hot::Header hdr{};
-            std::memcpy(&hdr, slot, sizeof(hdr));
-            if (hdr.msg_type == static_cast<std::uint16_t>(proto::hot::MsgType::OrderNew)) {
-                proto::hot::OrderNew order{};
-                std::memcpy(&order, slot, sizeof(order));
-                handle_order(order);
-            }
-            // Other inbound types (cancel, replace) are silently dropped at
-            // this scaffold stage; they land with the order-state machine.
-            in_.release();
-            ++processed;
-        }
+        processed += poll_inbound();
+        processed += poll_venue_in();
         return processed;
     }
 
 private:
-    void handle_order(proto::hot::OrderNew& order) noexcept {
+    std::size_t poll_inbound() noexcept {
+        std::size_t n = 0;
+        while (const auto* slot = in_.try_read()) {
+            proto::hot::Header hdr{};
+            std::memcpy(&hdr, slot, sizeof(hdr));
+            switch (static_cast<proto::hot::MsgType>(hdr.msg_type)) {
+                case proto::hot::MsgType::OrderNew: {
+                    proto::hot::OrderNew o{};
+                    std::memcpy(&o, slot, sizeof(o));
+                    handle_order_new(o);
+                    break;
+                }
+                case proto::hot::MsgType::OrderCancel: {
+                    proto::hot::OrderCancel c{};
+                    std::memcpy(&c, slot, sizeof(c));
+                    handle_order_cancel(c);
+                    break;
+                }
+                default:
+                    // OrderReplace and others are scaffold-stage drops.
+                    break;
+            }
+            in_.release();
+            ++n;
+        }
+        return n;
+    }
+
+    std::size_t poll_venue_in() noexcept {
+        std::size_t n = 0;
+        while (const auto* slot = venue_in_.try_read()) {
+            proto::hot::Header hdr{};
+            std::memcpy(&hdr, slot, sizeof(hdr));
+            switch (static_cast<proto::hot::MsgType>(hdr.msg_type)) {
+                case proto::hot::MsgType::OrderAck: {
+                    proto::hot::OrderAck a{};
+                    std::memcpy(&a, slot, sizeof(a));
+                    handle_order_ack(a);
+                    break;
+                }
+                case proto::hot::MsgType::OrderFill: {
+                    proto::hot::OrderFill f{};
+                    std::memcpy(&f, slot, sizeof(f));
+                    handle_order_fill(f);
+                    break;
+                }
+                case proto::hot::MsgType::OrderCancelAck: {
+                    proto::hot::OrderCancelAck ca{};
+                    std::memcpy(&ca, slot, sizeof(ca));
+                    handle_order_cancel_ack(ca);
+                    break;
+                }
+                default:
+                    // Venue-originated rejects land when a real gateway is
+                    // wired; skipped here so the skeleton stays small.
+                    break;
+            }
+            venue_in_.release();
+            ++n;
+        }
+        return n;
+    }
+
+    void handle_order_new(proto::hot::OrderNew& order) noexcept {
         runtime::stamp_hop(order.ts, runtime::HopStamp::Decision, clk_);
         const auto risk_t0 = clk_.now_ns();
         const auto outcome = risk::check_pre_trade(order, limits_, position_);
         const auto risk_t1 = clk_.now_ns();
         risk_lat_.record(risk_t1 - risk_t0);
 
-        if (outcome.accepted()) {
-            runtime::stamp_hop(order.ts, runtime::HopStamp::Submit, clk_);
-            emit(order);
-        } else {
-            proto::hot::OrderReject rej{};
-            rej.hdr.schema_major = proto::hot::kSchemaMajor;
-            rej.hdr.msg_type =
-                static_cast<std::uint16_t>(proto::hot::MsgType::OrderReject);
-            rej.hdr.seq = next_seq_++;
-            rej.ids = order.ids;
-            rej.reason = outcome.reason;
-            rej.ts = order.ts;
-            emit(rej);
+        if (!outcome.accepted()) {
+            emit_reject(order, outcome.reason);
+            return;
         }
+
+        // We must track every working order to keep position correct on fills.
+        // If the pool is exhausted, refuse the order rather than silently
+        // forwarding an order we can't account for.
+        auto* tracked = orders_pool_.construct();
+        if (tracked == nullptr) {
+            emit_reject(order, proto::hot::OrderRejectReason::RiskLimitBreached);
+            return;
+        }
+        tracked->cl_ord_id = order.ids.cl_ord_id;
+        tracked->exch_ord_id = 0;
+        tracked->qty_total = order.qty_raw;
+        tracked->qty_filled = 0;
+        tracked->side = order.side;
+        tracked->state = OrderState::PendingNew;
+        active_[active_count_++] = tracked;
+
+        runtime::stamp_hop(order.ts, runtime::HopStamp::Submit, clk_);
+        emit(order);
+    }
+
+    void handle_order_cancel(proto::hot::OrderCancel& cancel) noexcept {
+        auto* t = find_by_cl_ord_id(cancel.ids.cl_ord_id);
+        if (t == nullptr) {
+            // Unknown cl_ord_id — for the skeleton we drop. A real OMS would
+            // emit a CancelReject; that lands when we expand the message set.
+            return;
+        }
+        if (t->state == OrderState::PendingCancel) {
+            // Already cancelling; ignore duplicate.
+            return;
+        }
+        t->state = OrderState::PendingCancel;
+        // Echo the venue's exch_ord_id forward so the gateway can address it.
+        cancel.ids.exch_ord_id = t->exch_ord_id;
+        runtime::stamp_hop(cancel.ts, runtime::HopStamp::Submit, clk_);
+        emit(cancel);
+    }
+
+    void handle_order_ack(proto::hot::OrderAck& ack) noexcept {
+        auto* t = find_by_cl_ord_id(ack.ids.cl_ord_id);
+        if (t != nullptr) {
+            t->exch_ord_id = ack.ids.exch_ord_id;
+            if (t->state == OrderState::PendingNew) {
+                t->state = OrderState::Working;
+            }
+        }
+        // Forward to downstream regardless — strategy / post-trade need it.
+        emit(ack);
+    }
+
+    void handle_order_fill(proto::hot::OrderFill& fill) noexcept {
+        auto* t = find_by_cl_ord_id(fill.ids.cl_ord_id);
+        if (t != nullptr) {
+            const auto fq = fill.fill_qty_raw;
+            t->qty_filled += fq;
+            const std::int64_t signed_fill =
+                (t->side == proto::hot::Side::Sell) ? -fq : fq;
+            position_.current_qty += signed_fill;
+
+            if (t->qty_filled >= t->qty_total) {
+                release(t);
+            } else if (t->state != OrderState::PendingCancel) {
+                t->state = OrderState::PartiallyFilled;
+            }
+        }
+        emit(fill);
+    }
+
+    void handle_order_cancel_ack(proto::hot::OrderCancelAck& ca) noexcept {
+        auto* t = find_by_cl_ord_id(ca.ids.cl_ord_id);
+        if (t != nullptr) {
+            release(t);
+        }
+        emit(ca);
+    }
+
+    void emit_reject(const proto::hot::OrderNew& order,
+                     proto::hot::OrderRejectReason reason) noexcept {
+        proto::hot::OrderReject rej{};
+        rej.hdr.schema_major = proto::hot::kSchemaMajor;
+        rej.hdr.msg_type = static_cast<std::uint16_t>(proto::hot::MsgType::OrderReject);
+        rej.hdr.seq = next_seq_++;
+        rej.ids = order.ids;
+        rej.reason = reason;
+        rej.ts = order.ts;
+        emit(rej);
     }
 
     template <typename Msg>
@@ -119,12 +294,36 @@ private:
         out_.commit();
     }
 
+    [[nodiscard]] TrackedOrder* find_by_cl_ord_id(std::uint64_t id) noexcept {
+        for (std::size_t i = 0; i < active_count_; ++i) {
+            if (active_[i]->cl_ord_id == id) {
+                return active_[i];
+            }
+        }
+        return nullptr;
+    }
+
+    void release(TrackedOrder* t) noexcept {
+        // Swap-remove from active_ then return to pool.
+        for (std::size_t i = 0; i < active_count_; ++i) {
+            if (active_[i] == t) {
+                active_[i] = active_[--active_count_];
+                break;
+            }
+        }
+        orders_pool_.destroy(t);
+    }
+
     Inbound& in_;
+    VenueIn& venue_in_;
     Outbound& out_;
     const Clock& clk_;
     risk::Limits limits_{};
     risk::PositionView position_{};
     runtime::LatencyHistogram risk_lat_{};
+    memory::ObjectPool<TrackedOrder, MaxOpenOrders> orders_pool_{};
+    std::array<TrackedOrder*, MaxOpenOrders> active_{};
+    std::size_t active_count_{0};
     std::uint64_t next_seq_{1};
     std::uint64_t drops_{0};
 };
