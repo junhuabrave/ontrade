@@ -13,8 +13,8 @@ from .strategy import (
 __all__ = [
     "BookUpdate",
     "Fill",
-    "OrderRequest",
     "OrdType",
+    "OrderRequest",
     "Side",
     "Strategy",
     "Submitter",
