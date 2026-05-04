@@ -26,10 +26,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <utility>
 
 #include "core/messaging/shm_ring.hpp"
 #include "core/proto/hot/messages.hpp"
+#include "core/runtime/archive.hpp"
 #include "core/runtime/clock.hpp"
 #include "core/runtime/latency.hpp"
 
@@ -88,6 +90,12 @@ public:
 
     [[nodiscard]] StrategyT& strategy() noexcept { return strategy_; }
     [[nodiscard]] const StrategyT& strategy() const noexcept { return strategy_; }
+
+    // Archive hook (issue #4 acknowledges this is the wrong layer; tactical
+    // for Stage 1.1B). Setter rather than ctor param because the variadic
+    // strategy_args make adding a defaulted ctor argument awkward.
+    void set_archive(runtime::Archive* archive) noexcept { archive_ = archive; }
+    [[nodiscard]] runtime::Archive* archive() const noexcept { return archive_; }
 
     [[nodiscard]] std::uint64_t orders_submitted() const noexcept { return orders_submitted_; }
     [[nodiscard]] std::uint64_t cancels_submitted() const noexcept { return cancels_submitted_; }
@@ -232,6 +240,13 @@ private:
         }
         std::memcpy(slot, &m, sizeof(Msg));
         to_oms_.commit();
+        if (archive_ != nullptr) {
+            const auto* bytes = reinterpret_cast<const std::byte*>(&m);
+            (void)archive_->append(
+                runtime::RingTag::ToOms,
+                std::span<const std::byte>(bytes, sizeof(Msg)),
+                clk_.wall_ns());
+        }
         return true;
     }
 
@@ -244,6 +259,7 @@ private:
     std::uint64_t next_seq_{1};
     std::uint64_t orders_submitted_{0};
     std::uint64_t cancels_submitted_{0};
+    runtime::Archive* archive_{nullptr};
     std::uint64_t drops_{0};
     std::uint64_t md_processed_{0};
     std::uint64_t events_processed_{0};
