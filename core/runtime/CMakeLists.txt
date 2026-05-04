@@ -19,4 +19,12 @@ if(ONTRADE_BUILD_TESTS)
     )
     ontrade_apply_warnings(latency_test)
     gtest_discover_tests(latency_test)
+
+    add_executable(archive_test archive_test.cc)
+    target_link_libraries(archive_test PRIVATE
+        ontrade_runtime
+        GTest::gtest_main
+    )
+    ontrade_apply_warnings(archive_test)
+    gtest_discover_tests(archive_test)
 endif()
