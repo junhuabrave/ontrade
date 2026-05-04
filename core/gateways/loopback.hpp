@@ -23,9 +23,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 
 #include "core/messaging/shm_ring.hpp"
 #include "core/proto/hot/messages.hpp"
+#include "core/runtime/archive.hpp"
 #include "core/runtime/clock.hpp"
 
 namespace ontrade::gateways {
@@ -46,8 +48,9 @@ public:
         bool auto_cancel_ack = true;
     };
 
-    LoopbackGateway(FromOms& from_oms, ToOms& to_oms, const Clock& clk) noexcept
-        : from_oms_(from_oms), to_oms_(to_oms), clk_(clk) {}
+    LoopbackGateway(FromOms& from_oms, ToOms& to_oms, const Clock& clk,
+                    runtime::Archive* archive = nullptr) noexcept
+        : from_oms_(from_oms), to_oms_(to_oms), clk_(clk), archive_(archive) {}
 
     LoopbackGateway(const LoopbackGateway&) = delete;
     LoopbackGateway& operator=(const LoopbackGateway&) = delete;
@@ -56,6 +59,8 @@ public:
 
     void set_behavior(const Behavior& b) noexcept { behavior_ = b; }
     [[nodiscard]] Behavior behavior() const noexcept { return behavior_; }
+    void set_archive(runtime::Archive* archive) noexcept { archive_ = archive; }
+    [[nodiscard]] runtime::Archive* archive() const noexcept { return archive_; }
 
     [[nodiscard]] std::uint64_t orders_acked() const noexcept { return orders_acked_; }
     [[nodiscard]] std::uint64_t fills_emitted() const noexcept { return fills_emitted_; }
@@ -152,6 +157,16 @@ private:
         }
         std::memcpy(slot, &m, sizeof(Msg));
         to_oms_.commit();
+        // From the gateway's POV its egress ring is the OMS's venue_in.
+        // Tag it accordingly so the archive captures the canonical
+        // ring-of-record name across all components.
+        if (archive_ != nullptr) {
+            const auto* bytes = reinterpret_cast<const std::byte*>(&m);
+            (void)archive_->append(
+                runtime::RingTag::VenueIn,
+                std::span<const std::byte>(bytes, sizeof(Msg)),
+                clk_.wall_ns());
+        }
         return true;
     }
 
@@ -165,6 +180,7 @@ private:
     std::uint64_t fills_emitted_{0};
     std::uint64_t cancels_acked_{0};
     std::uint64_t drops_{0};
+    runtime::Archive* archive_{nullptr};
 };
 
 }  // namespace ontrade::gateways

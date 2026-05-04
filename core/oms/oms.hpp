@@ -47,6 +47,7 @@
 #include "core/messaging/shm_ring.hpp"
 #include "core/proto/hot/messages.hpp"
 #include "core/risk/limits.hpp"
+#include "core/runtime/archive.hpp"
 #include "core/runtime/clock.hpp"
 #include "core/runtime/latency.hpp"
 
@@ -123,9 +124,12 @@ public:
     using Events = messaging::SpscRing<kSlotSize, EventsSlots>;
 
     Oms(Inbound& inbound, VenueIn& venue_in, ToVenue& to_venue, Events& events,
-        const Clock& clk) noexcept
+        const Clock& clk, runtime::Archive* archive = nullptr) noexcept
         : in_(inbound), venue_in_(venue_in), to_venue_(to_venue),
-          events_(events), clk_(clk) {}
+          events_(events), clk_(clk), archive_(archive) {}
+
+    void set_archive(runtime::Archive* archive) noexcept { archive_ = archive; }
+    [[nodiscard]] runtime::Archive* archive() const noexcept { return archive_; }
 
     Oms(const Oms&) = delete;
     Oms& operator=(const Oms&) = delete;
@@ -352,23 +356,47 @@ private:
 
     template <typename Msg>
     void emit_to_venue(const Msg& m) noexcept {
-        emit_into(to_venue_, m, to_venue_drops_);
+        if (emit_into(to_venue_, m, to_venue_drops_)) {
+            archive_record(runtime::RingTag::ToVenue, m);
+        }
     }
 
     template <typename Msg>
     void emit_event(const Msg& m) noexcept {
-        emit_into(events_, m, event_drops_);
+        if (emit_into(events_, m, event_drops_)) {
+            archive_record(runtime::RingTag::Events, m);
+        }
     }
 
     template <typename Ring, typename Msg>
-    void emit_into(Ring& ring, const Msg& m, std::uint64_t& drops) noexcept {
+    [[nodiscard]] bool emit_into(Ring& ring, const Msg& m,
+                                 std::uint64_t& drops) noexcept {
         auto* slot = ring.try_claim();
         if (slot == nullptr) {
             ++drops;
-            return;
+            return false;
         }
         std::memcpy(slot, &m, sizeof(Msg));
         ring.commit();
+        return true;
+    }
+
+    // Append the just-published message to the archive if one is attached.
+    // Only called on successful emit, so the archive captures exactly the
+    // bytes that went on the ring (replay parity invariant). Note: this
+    // tactical wiring is the producer-side hook called out in issue #4 —
+    // a future refactor moves this to a separate-consumer journaler so
+    // the I/O does not run on the producer's thread.
+    template <typename Msg>
+    void archive_record(runtime::RingTag tag, const Msg& m) noexcept {
+        if (archive_ == nullptr) {
+            return;
+        }
+        const auto* bytes = reinterpret_cast<const std::byte*>(&m);
+        (void)archive_->append(
+            tag,
+            std::span<const std::byte>(bytes, sizeof(Msg)),
+            clk_.wall_ns());
     }
 
     [[nodiscard]] TrackedOrder* find_by_cl_ord_id(std::uint64_t id) noexcept {
@@ -410,6 +438,7 @@ private:
     std::uint64_t orders_rejected_capacity_{0};
     std::uint64_t fills_received_{0};
     std::uint64_t cancels_acked_{0};
+    runtime::Archive* archive_{nullptr};
 };
 
 }  // namespace ontrade::oms
